@@ -99,6 +99,24 @@ async function main() {
     const poolAbi = ["function getUserAccountData(address) view returns (uint256,uint256,uint256,uint256,uint256,uint256)", "event Borrow(address indexed, address indexed, address indexed, uint256, uint256, uint256, uint16)"];
     const aavePool = new ethers.Contract(AAVE_POOL, poolAbi, provider);
 
+    // 1. SCANSIONE STORICA "LIGHT" (Compatibile con Free Tier)
+    console.log("⏳ Scansione rapida ultimi blocchi...");
+    const currentBlock = await provider.getBlockNumber();
+    
+    // Chiediamo solo gli ultimi 10 blocchi (limite Alchemy Free)
+    // Se vuoi di più, dovresti fare un ciclo, ma per ora basta questo per verificare che funzioni
+    try {
+        const pastEvents = await aavePool.queryFilter("Borrow", currentBlock - 10, currentBlock);
+        pastEvents.forEach(e => {
+            if (!targets.has(e.args.user)) {
+                targets.add(e.args.user);
+                console.log(`🔎 Trovato utente storico: ${e.args.user}`);
+            }
+        });
+    } catch (e) {
+        console.log("⚠️ Scansione storica saltata (Limiti RPC)");
+    }
+    
     // Notifica di avvio
     logAndNotify("🚀 <b>Bot Avviato!</b>\nScrivi /status per controllare.", "START");
 
