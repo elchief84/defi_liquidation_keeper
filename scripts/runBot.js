@@ -1,72 +1,120 @@
 const { ethers } = require("hardhat");
 const fs = require("fs");
+const path = require("path");
+const TelegramBot = require('node-telegram-bot-api'); // Nuova libreria
 require("dotenv").config();
 
-// --- CONFIGURAZIONE UTENTE ---
-// Metti 'true' per testare in locale con 'npx hardhat node'
-// Metti 'false' per andare in produzione sulla VPS
+// --- CONFIGURAZIONE ---
 const IS_LOCAL_TEST = false; 
-
-// INSERISCI QUI L'INDIRIZZO DEL CONTRATTO DEPLOYATO
 const MY_BOT_ADDRESS = "0x647Aa5C5321bD53E9B43CFB95213541d2945A684"; 
-const path = require("path");
 const DATA_DIR = "data";
 const DB_FILE = path.join(DATA_DIR, "targets.json");
 
-// INDIRIZZI ARBITRUM
+// Indirizzi Arbitrum
 const AAVE_POOL = "0x794a61358D6845594F94dc1DB02A252b5b4814aD";
 const USDC = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
 const WETH = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1";
 
+// --- STATO DEL BOT (Memoria) ---
 let targets = new Set();
+let activityLog = []; // Tiene traccia delle ultime 3 attività
+let lastBlockProcessed = 0;
+let startTime = Date.now();
+
+// --- INIZIALIZZAZIONE TELEGRAM ---
+const token = process.env.TELEGRAM_BOT_TOKEN;
+const ownerChatId = process.env.TELEGRAM_CHAT_ID;
+let telegramBot = null;
+
+if (token) {
+    // polling: true permette al bot di ricevere messaggi
+    telegramBot = new TelegramBot(token, { polling: true });
+    console.log("📡 Telegram Bot in ascolto comandi...");
+
+    // COMANDO 1: /status
+    telegramBot.onText(/\/status/, (msg) => {
+        if (msg.chat.id.toString() !== ownerChatId) return; // Sicurezza: risponde solo a te
+        
+        const uptime = ((Date.now() - startTime) / 1000 / 60).toFixed(1); // Minuti
+        const statusMsg = `
+🤖 <b>SYSTEM STATUS</b>
+━━━━━━━━━━━━━━
+✅ <b>Operativo:</b> Sì
+⏱ <b>Uptime:</b> ${uptime} min
+📦 <b>Ultimo Blocco:</b> ${lastBlockProcessed}
+🎯 <b>Bersagli nel DB:</b> ${targets.size}
+📡 <b>Modalità:</b> ${IS_LOCAL_TEST ? 'TEST 🧪' : 'MAINNET 🚀'}
+`;
+        telegramBot.sendMessage(ownerChatId, statusMsg, { parse_mode: 'HTML' });
+    });
+
+    // COMANDO 2: /activity
+    telegramBot.onText(/\/activity/, (msg) => {
+        if (msg.chat.id.toString() !== ownerChatId) return;
+
+        if (activityLog.length === 0) {
+            telegramBot.sendMessage(ownerChatId, "📭 Nessuna attività recente.");
+            return;
+        }
+
+        let reply = "📋 <b>ULTIME 3 ATTIVITÀ</b>\n\n";
+        activityLog.forEach((log, index) => {
+            reply += `${index + 1}. ${log}\n────────────────\n`;
+        });
+        telegramBot.sendMessage(ownerChatId, reply, { parse_mode: 'HTML', disable_web_page_preview: true });
+    });
+}
+
+// Funzione Helper per inviare notifiche e salvare nel log
+function logAndNotify(message, type = "INFO") {
+    console.log(`[${type}] ${message.replace(/<[^>]*>?/gm, '')}`); // Log pulito in console
+    
+    // Aggiorna lo storico (massimo 3 elementi)
+    const timestamp = new Date().toLocaleTimeString('it-IT');
+    activityLog.unshift(`[${timestamp}] ${message}`);
+    if (activityLog.length > 3) activityLog.pop();
+
+    // Invia a Telegram
+    if (telegramBot && ownerChatId) {
+        telegramBot.sendMessage(ownerChatId, message, { parse_mode: 'HTML' });
+    }
+}
 
 async function main() {
-    console.log("🤖 AVVIO BOT...");
-    sendTelegram("🤖 Bot Riavviato e Pronto!");
-
-    // Creiamo la cartella 'data' se non esiste (fondamentale per Docker)
-    if (!fs.existsSync(DATA_DIR)){
-        fs.mkdirSync(DATA_DIR);
-    }
-
+    console.log("🤖 AVVIO BOT LIQUIDATORE 2.0...");
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
     loadTargets();
-    let provider, wallet;
 
+    // Provider Setup
+    let provider, wallet;
     if (IS_LOCAL_TEST) {
-        console.log("🧪 TEST MODE: WebSocket Locale");
         provider = new ethers.WebSocketProvider("ws://127.0.0.1:8545");
-        // Chiave privata finta di Hardhat (Account 0)
         wallet = new ethers.Wallet("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80", provider);
     } else {
-        console.log("🚀 PRODUCTION MODE: Alchemy WSS");
         provider = new ethers.WebSocketProvider(process.env.ALCHEMY_WSS_URL);
         wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
     }
 
     const bot = await ethers.getContractAt("AaveLiquidator", MY_BOT_ADDRESS, wallet);
-    const poolAbi = [
-        "function getUserAccountData(address user) view returns (uint256, uint256, uint256, uint256, uint256, uint256 healthFactor)",
-        "event Borrow(address indexed reserve, address indexed user, address indexed onBehalfOf, uint256 amount, uint256 interestRateMode, uint256 borrowRate, uint16 referralCode)"
-    ];
+    const poolAbi = ["function getUserAccountData(address) view returns (uint256,uint256,uint256,uint256,uint256,uint256)", "event Borrow(address indexed, address indexed, address indexed, uint256, uint256, uint256, uint16)"];
     const aavePool = new ethers.Contract(AAVE_POOL, poolAbi, provider);
 
-    // 1. SCANSIONE STORICA (Disabilitata per limiti Alchemy Free Tier)
-    /* 
-    console.log("⏳ Sync database...");
-    const currentBlock = await provider.getBlockNumber();
-    // QUESTA E' LA RIGA CHE DAVA ERRORE:
-    const pastEvents = await aavePool.queryFilter("Borrow", currentBlock - 2000, currentBlock);
-    pastEvents.forEach(e => targets.add(e.args.user));
-    */
-    console.log(`✅ Scansione storica saltata. Si parte dal DB locale.`);
+    // Notifica di avvio
+    logAndNotify("🚀 <b>Bot Avviato!</b>\nScrivi /status per controllare.", "START");
 
-    // 2. LIVE LISTENER
+    // Live Listener
     aavePool.on("Borrow", (reserve, user) => {
-        if (!targets.has(user)) { targets.add(user); console.log(`🆕 Nuovo User: ${user}`); }
+        if (!targets.has(user)) { 
+            targets.add(user); 
+            // Non notifichiamo ogni nuovo user per non spammare, ma lo logghiamo silenziosamente
+            console.log(`🆕 Nuovo User aggiunto: ${user}`);
+        }
     });
 
-    // 3. PARALLEL CHECKER
+    // Block Listener
     provider.on("block", async (blockNumber) => {
+        lastBlockProcessed = blockNumber; // Aggiorniamo lo stato per il comando /status
+        
         const arr = Array.from(targets);
         if (arr.length === 0) return;
         
@@ -75,72 +123,37 @@ async function main() {
         const batch = arr.slice(start, start + BATCH);
         
         console.log(`⚡️ Blocco ${blockNumber}: Check ${batch.length} utenti...`);
-        
-        // Esecuzione Parallela
         await Promise.all(batch.map(user => checkUser(user, aavePool, bot, provider)));
     });
 
-    setInterval(() => fs.writeFileSync(DB_FILE, JSON.stringify(Array.from(targets))), 300000);
+    setInterval(saveTargets, 300000); // Save ogni 5 min
 }
 
 async function checkUser(user, pool, bot, provider) {
     try {
         const data = await pool.getUserAccountData(user);
         
-        // Se HF < 1.0
-        if (data.healthFactor < 1000000000000000000n && data.healthFactor > 0n) {
-            console.log(`🚨 TARGET: ${user} HF: ${ethers.formatUnits(data.healthFactor, 18)}`);
-
-            const msgTrovato = `🚨 <b>BERSAGLIO TROVATO!</b>\nUser: <code>${user}</code>\nHF: ${ethers.formatUnits(healthFactor, 18)}`;
-            console.log(msgTrovato);
-            sendTelegram(msgTrovato); // <--- NOTIFICA 1: Target avvistato
+        if (data[5] < 1000000000000000000n && data[5] > 0n) { // HealthFactor < 1.0
             
-            // Tentativo Liquidazione 2000 USDC
+            // 1. Notifica Avvistamento
+            logAndNotify(`🚨 <b>TARGET VULNERABILE!</b>\nUser: <code>${user}</code>\nHF: ${ethers.formatUnits(data[5], 18)}`, "ALERT");
+            
             const feeData = await provider.getFeeData();
+            
+            // 2. Tentativo Liquidazione
             bot.requestFlashLoan(USDC, ethers.parseUnits("2000", 6), WETH, user, {
                 maxFeePerGas: feeData.maxFeePerGas * 2n,
                 maxPriorityFeePerGas: feeData.maxPriorityFeePerGas * 3n
             }).then(tx => {
-                console.log(`🔫 TX Inviata: ${tx.hash}`);
-
-                sendTelegram(msgTx); // <--- NOTIFICA 2: Sparo effettuato
-
-                // Aspettiamo la conferma per cantare vittoria
-                tx.wait().then((receipt) => {
-                    if (receipt.status === 1) {
-                         sendTelegram(`✅ <b>LIQUIDAZIONE RIUSCITA!</b> 💰\nControlla il wallet!`);
-                    } else {
-                         sendTelegram(`❌ <b>Transazione Fallita</b> (Reverted on-chain)`);
-                    }
-                }); 
-            }).catch(e => {});
+                logAndNotify(`🔫 <b>TX Inviata!</b>\nHash: <a href="https://arbiscan.io/tx/${tx.hash}">Click per vedere</a>`, "ACTION");
+            }).catch(e => {
+                // Logghiamo l'errore solo se è critico, altrimenti intasa la chat
+            });
         }
     } catch (e) {}
 }
 
-async function sendTelegram(message) {
-    const token = process.env.TELEGRAM_BOT_TOKEN;
-    const chatId = process.env.TELEGRAM_CHAT_ID;
-
-    if (!token || !chatId) return; // Se non sono configurati, non fa nulla
-
-    const url = `https://api.telegram.org/bot${token}/sendMessage`;
-    
-    try {
-        await fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                chat_id: chatId,
-                text: message,
-                parse_mode: 'HTML' // Permette grassetto ed emoji
-            })
-        });
-    } catch (error) {
-        console.error("Errore invio Telegram:", error.message);
-    }
-}
-
 function loadTargets() { try { JSON.parse(fs.readFileSync(DB_FILE)).forEach(t => targets.add(t)); } catch(e){} }
+function saveTargets() { try { fs.writeFileSync(DB_FILE, JSON.stringify(Array.from(targets))); } catch(e){} }
 
 main().catch((error) => { console.error(error); process.exitCode = 1; });
