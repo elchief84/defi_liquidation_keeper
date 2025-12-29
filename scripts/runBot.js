@@ -22,12 +22,13 @@ let targets = new Set();
 
 async function main() {
     console.log("🤖 AVVIO BOT...");
+    sendTelegram("🤖 Bot Riavviato e Pronto!");
 
     // Creiamo la cartella 'data' se non esiste (fondamentale per Docker)
     if (!fs.existsSync(DATA_DIR)){
         fs.mkdirSync(DATA_DIR);
     }
-    
+
     loadTargets();
     let provider, wallet;
 
@@ -89,15 +90,55 @@ async function checkUser(user, pool, bot, provider) {
         // Se HF < 1.0
         if (data.healthFactor < 1000000000000000000n && data.healthFactor > 0n) {
             console.log(`🚨 TARGET: ${user} HF: ${ethers.formatUnits(data.healthFactor, 18)}`);
+
+            const msgTrovato = `🚨 <b>BERSAGLIO TROVATO!</b>\nUser: <code>${user}</code>\nHF: ${ethers.formatUnits(healthFactor, 18)}`;
+            console.log(msgTrovato);
+            sendTelegram(msgTrovato); // <--- NOTIFICA 1: Target avvistato
             
             // Tentativo Liquidazione 2000 USDC
             const feeData = await provider.getFeeData();
             bot.requestFlashLoan(USDC, ethers.parseUnits("2000", 6), WETH, user, {
                 maxFeePerGas: feeData.maxFeePerGas * 2n,
                 maxPriorityFeePerGas: feeData.maxPriorityFeePerGas * 3n
-            }).then(tx => console.log(`🔫 TX Inviata: ${tx.hash}`)).catch(e => {});
+            }).then(tx => {
+                console.log(`🔫 TX Inviata: ${tx.hash}`);
+
+                sendTelegram(msgTx); // <--- NOTIFICA 2: Sparo effettuato
+
+                // Aspettiamo la conferma per cantare vittoria
+                tx.wait().then((receipt) => {
+                    if (receipt.status === 1) {
+                         sendTelegram(`✅ <b>LIQUIDAZIONE RIUSCITA!</b> 💰\nControlla il wallet!`);
+                    } else {
+                         sendTelegram(`❌ <b>Transazione Fallita</b> (Reverted on-chain)`);
+                    }
+                }); 
+            }).catch(e => {});
         }
     } catch (e) {}
+}
+
+async function sendTelegram(message) {
+    const token = process.env.TELEGRAM_BOT_TOKEN;
+    const chatId = process.env.TELEGRAM_CHAT_ID;
+
+    if (!token || !chatId) return; // Se non sono configurati, non fa nulla
+
+    const url = `https://api.telegram.org/bot${token}/sendMessage`;
+    
+    try {
+        await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                chat_id: chatId,
+                text: message,
+                parse_mode: 'HTML' // Permette grassetto ed emoji
+            })
+        });
+    } catch (error) {
+        console.error("Errore invio Telegram:", error.message);
+    }
 }
 
 function loadTargets() { try { JSON.parse(fs.readFileSync(DB_FILE)).forEach(t => targets.add(t)); } catch(e){} }
