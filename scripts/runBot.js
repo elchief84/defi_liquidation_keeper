@@ -9,7 +9,9 @@ const IS_LOCAL_TEST = false;
 
 // INSERISCI QUI L'INDIRIZZO DEL CONTRATTO DEPLOYATO
 const MY_BOT_ADDRESS = "0x647Aa5C5321bD53E9B43CFB95213541d2945A684"; 
-const DB_FILE = "targets.json";
+const path = require("path");
+const DATA_DIR = "data";
+const DB_FILE = path.join(DATA_DIR, "targets.json");
 
 // INDIRIZZI ARBITRUM
 const AAVE_POOL = "0x794a61358D6845594F94dc1DB02A252b5b4814aD";
@@ -19,6 +21,13 @@ const WETH = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1";
 let targets = new Set();
 
 async function main() {
+    console.log("🤖 AVVIO BOT...");
+
+    // Creiamo la cartella 'data' se non esiste (fondamentale per Docker)
+    if (!fs.existsSync(DATA_DIR)){
+        fs.mkdirSync(DATA_DIR);
+    }
+    
     loadTargets();
     let provider, wallet;
 
