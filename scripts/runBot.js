@@ -163,4 +163,16 @@ async function checkUser(user, pool, bot, provider) {
 function loadTargets() { try { JSON.parse(fs.readFileSync(DB_FILE)).forEach(t => targets.add(t)); } catch(e){} }
 function saveTargets() { try { fs.writeFileSync(DB_FILE, JSON.stringify(Array.from(targets))); } catch(e){} }
 
+// Impedisce al bot di crashare se Alchemy chiude la connessione
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('⚠️ Errore non gestito (probabile limite RPC):', reason);
+    // Non facciamo nulla, PM2 riavvierà il bot se necessario o il loop continuerà al prossimo blocco
+});
+
+process.on('uncaughtException', (err) => {
+    console.error('💀 Errore critico:', err);
+    // Aspettiamo 5 secondi e lasciamo che PM2 lo riavvii
+    setTimeout(() => process.exit(1), 5000);
+});
+
 main().catch((error) => { console.error(error); process.exitCode = 1; });
