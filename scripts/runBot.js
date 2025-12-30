@@ -12,12 +12,13 @@ const AAVE_POOL = "0x794a61358D6845594F94dc1DB02A252b5b4814aD";
 const USDC = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
 const WETH = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1";
 
-// --- STATO E CACHE ---
+// --- STATO ---
 let targets = new Set();
 const userCache = new Map();
 let lastBlockProcessed = 0;
+let telegramBot = null; // Inizializzato dopo
 
-// --- GESTORE PROVIDER INTELLIGENTE ---
+// --- PROVIDER MANAGER ---
 const rpcUrls = [
     process.env.RPC_1,
     process.env.RPC_2,
@@ -28,31 +29,25 @@ const rpcUrls = [
 
 class SmartProviderManager {
     constructor(urls) {
-        // OTTIMIZZAZIONE: staticNetwork: true impedisce ad ethers di chiamare il provider all'avvio
-        this.providers = urls.map(url => 
-            new ethers.JsonRpcProvider(url, 42161, { staticNetwork: true })
-        );
+        // Forza Arbitrum (42161) e staticNetwork per evitare chiamate extra all'avvio
+        this.providers = urls.map(url => new ethers.JsonRpcProvider(url, 42161, { staticNetwork: true }));
         this.index = 0;
     }
 
     async execute(task) {
         for (let i = 0; i < this.providers.length; i++) {
-            const currentProvider = this.providers[this.index];
             try {
-                const result = await task(currentProvider);
+                const result = await task(this.providers[this.index]);
                 this.index = (this.index + 1) % this.providers.length;
                 return result;
             } catch (err) {
-                // Se l'errore è 429 (limite Alchemy), passiamo oltre senza pietà
                 this.index = (this.index + 1) % this.providers.length;
-                continue;
+                if (i === this.providers.length - 1) throw err;
             }
         }
-        throw new Error("Tutti i provider sono offline o limitati.");
     }
 
-    // Trova il primo provider che risponde davvero per le funzioni di ascolto
-    async getFirstWorkingProvider() {
+    async getFirstWorking() {
         for (let p of this.providers) {
             try {
                 await p.getBlockNumber();
@@ -62,67 +57,83 @@ class SmartProviderManager {
         return this.providers[0];
     }
 }
-const pManager = new SmartProviderManager(rpcUrls);
-
-// --- TELEGRAM ---
-const tBot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
 
 async function main() {
-    console.log(`🦅 CECCHINO DeFi AVVIATO`);
+    console.log("🦅 AVVIO BOT LIQUIDATORE...");
+    
+    const pManager = new SmartProviderManager(rpcUrls);
+    
+    // 1. Inizializzazione Telegram DENTRO Main con protezione
+    const token = process.env.TELEGRAM_BOT_TOKEN;
+    const chatId = process.env.TELEGRAM_CHAT_ID;
+
+    if (token && chatId) {
+        try {
+            telegramBot = new TelegramBot(token, { 
+                polling: { 
+                    autoStart: true,
+                    params: { drop_pending_updates: true } // Pulisce i vecchi messaggi al riavvio
+                } 
+            });
+            console.log("📡 Telegram Bot Connesso.");
+            
+            telegramBot.onText(/\/status/, (msg) => {
+                if (msg.chat.id.toString() !== chatId) return;
+                telegramBot.sendMessage(chatId, `✅ <b>Bot Online</b>\n🎯 Targets: ${targets.size}\n📦 Blocco: ${lastBlockProcessed}`, {parse_mode: 'HTML'});
+            });
+        } catch (e) {
+            console.log("⚠️ Errore inizializzazione Telegram:", e.message);
+        }
+    }
+
+    // 2. Setup Filesystem
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    loadTargets();
+    if (fs.existsSync(DB_FILE)) {
+        try { JSON.parse(fs.readFileSync(DB_FILE)).forEach(t => targets.add(t)); } catch(e) {}
+    }
 
-    // Troviamo un provider che funzioni per inizializzare il bot
-    const activeProvider = await pManager.getFirstWorkingProvider();
-    console.log(`📡 Connesso a un nodo funzionante per l'avvio.`);
-
+    // 3. Connessione Blockchain
+    const activeProvider = await pManager.getFirstWorking();
     const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, activeProvider);
     const botContract = await ethers.getContractAt("AaveLiquidator", MY_BOT_ADDRESS, wallet);
+    
+    console.log(`📡 Network pronto. Monitoraggio avviato.`);
 
-    // Listener eventi (usiamo il provider attivo trovato)
+    // 4. Listener Eventi
     const aave = new ethers.Contract(AAVE_POOL, ["event Borrow(address indexed reserve, address indexed user, address indexed onBehalfOf, uint256 amount, uint256 interestRateMode, uint256 borrowRate, uint16 referralCode)"], activeProvider);
-    aave.on("Borrow", (res, user) => { 
-        if (!targets.has(user)) {
-            targets.add(user);
-            console.log(`🆕 Nuovo Target: ${user}`);
-        }
-    });
+    aave.on("Borrow", (res, user) => targets.add(user));
 
-    // Loop sui blocchi
+    // 5. Loop sui blocchi
     activeProvider.on("block", async (blockNumber) => {
         lastBlockProcessed = blockNumber;
         const arr = Array.from(targets);
         if (arr.length === 0) return;
 
-        const BATCH_SIZE = 10; // Ridotto un po' per sicurezza
-        const start = (blockNumber * BATCH_SIZE) % arr.length;
-        const batch = arr.slice(start, start + BATCH_SIZE);
+        const BATCH = 10;
+        const start = (blockNumber * BATCH) % arr.length;
+        const batch = arr.slice(start, start + BATCH);
 
         for (const user of batch) {
             const now = Date.now();
             const cached = userCache.get(user);
             let waitTime = 30 * 60 * 1000;
-            if (cached) {
-                if (cached.hf < 1.05) waitTime = 0;
-                else if (cached.hf < 1.15) waitTime = 60 * 1000;
-            }
+            if (cached && cached.hf < 1.1) waitTime = 0;
 
             if (!cached || (now - cached.lastCheck) > waitTime) {
-                checkAndLiquidate(user, botContract).catch(() => {});
+                checkUser(user, botContract, pManager, chatId);
             }
         }
     });
 
-    // Telegram Status
-    tBot.onText(/\/status/, (msg) => {
-        tBot.sendMessage(msg.chat.id, `✅ <b>Bot Operativo</b>\n🎯 Targets: ${targets.size}\n📦 Blocco: ${lastBlockProcessed}\n📡 Nodi configurati: ${rpcUrls.length}`, {parse_mode: 'HTML'});
-    });
+    setInterval(() => {
+        fs.writeFileSync(DB_FILE, JSON.stringify(Array.from(targets)));
+    }, 300000);
 }
 
-async function checkAndLiquidate(user, botContract) {
+async function checkUser(user, botContract, pManager, chatId) {
     try {
-        const data = await pManager.execute(async (provider) => {
-            const pool = new ethers.Contract(AAVE_POOL, ["function getUserAccountData(address) view returns (uint256,uint256,uint256,uint256,uint256,uint256 hf)"], provider);
+        const data = await pManager.execute(async (prov) => {
+            const pool = new ethers.Contract(AAVE_POOL, ["function getUserAccountData(address) view returns (uint256,uint256,uint256,uint256,uint256,uint256 hf)"], prov);
             return await pool.getUserAccountData(user);
         });
 
@@ -130,25 +141,15 @@ async function checkAndLiquidate(user, botContract) {
         userCache.set(user, { hf: hf, lastCheck: Date.now() });
 
         if (hf < 1.0 && data.hf > 0n) {
-            // Se troviamo un bersaglio, notifichiamo
-            const msg = `🚨 <b>TARGET VULNERABILE!</b>\nUser: <code>${user}</code>\nHF: ${hf.toFixed(4)}`;
-            tBot.sendMessage(process.env.TELEGRAM_CHAT_ID, msg, {parse_mode: 'HTML'});
+            const alert = `🚨 <b>VULNERABILE:</b> ${user}\nHF: ${hf.toFixed(4)}`;
+            if (telegramBot) telegramBot.sendMessage(chatId, alert, {parse_mode: 'HTML'});
             
-            // Tenta liquidazione
-            const feeData = await pManager.providers[0].getFeeData().catch(() => ({maxPriorityFeePerGas: 100000000n}));
-            botContract.requestFlashLoan(USDC, ethers.parseUnits("1500", 6), WETH, user, {
-                maxPriorityFeePerGas: feeData.maxPriorityFeePerGas * 2n
-            }).catch(() => {});
+            // Tentativo liquidazione rapido
+            botContract.requestFlashLoan(USDC, ethers.parseUnits("1500", 6), WETH, user).catch(() => {});
         }
-    } catch (e) {}
+    } catch (e) {
+        // Errore ignorato, passerà al prossimo provider
+    }
 }
-
-function loadTargets() {
-    try { if (fs.existsSync(DB_FILE)) { JSON.parse(fs.readFileSync(DB_FILE)).forEach(t => targets.add(t)); } } catch (e) {}
-}
-function saveTargets() {
-    try { fs.writeFileSync(DB_FILE, JSON.stringify(Array.from(targets))); } catch (e) {}
-}
-setInterval(saveTargets, 300000);
 
 main().catch(console.error);
