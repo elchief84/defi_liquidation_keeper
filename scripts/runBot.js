@@ -157,20 +157,39 @@ async function checkUser(user, botContract) {
         userCache.set(user, { hf, lastCheck: now });
 
         if (hf < 1.0 && data.hf > 0n && isBotEnabled) {
+            // Segnamo il tentativo per non spammare
             blacklist.set(user, now);
-            logAndNotify(`🚨 <b>TARGET VULNERABILE!</b>\nUser: ${user}\nHF: ${hf.toFixed(4)}`);
+            
+            logAndNotify(`🚨 <b>TARGET VULNERABILE!</b>\nUser: <code>${user}</code>\nHF: ${hf.toFixed(4)}`);
 
             try {
-                const feeData = await pManager.providers[0].getFeeData();
-                const tx = await botContract.requestFlashLoan(USDC, ethers.parseUnits("1500", 6), WETH, user, {
-                    gasLimit: 1100000,
-                    maxPriorityFeePerGas: feeData.maxPriorityFeePerGas * 5n, // Più aggressivo per vincere
-                    maxFeePerGas: feeData.maxFeePerGas * 2n
+                // Proviamo a usare pManager per inviare la TX (ruota i provider)
+                await pManager.execute(async (prov) => {
+                    const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, prov);
+                    const botWithProvider = botContract.connect(wallet);
+                    const feeData = await prov.getFeeData();
+
+                    const tx = await botWithProvider.requestFlashLoan(USDC, ethers.parseUnits("1500", 6), WETH, user, {
+                        gasLimit: 1200000,
+                        maxPriorityFeePerGas: feeData.maxPriorityFeePerGas * 6n, // Ancora più aggressivo
+                        maxFeePerGas: feeData.maxFeePerGas * 2n
+                    });
+                    
+                    logAndNotify(`🔫 <b>COLPO LANCIATO!</b>\n<a href="https://arbiscan.io/tx/${tx.hash}">Vedi su Arbiscan</a>`);
                 });
-                
-                logAndNotify(`🔫 <b>TX INVIATA!</b>\n<a href="https://arbiscan.io/tx/${tx.hash}">Vedi su Arbiscan</a>`);
+
             } catch (err) {
-                console.log("Errore sparo silenzioso.");
+                // ORA TELEGRAM TI DICE IL VERO ERRORE
+                const errorShort = err.message.substring(0, 100);
+                console.log(`Errore sparo per ${user}: ${errorShort}`);
+                
+                // Se l'errore è "execution reverted", significa che il debito non è in USDC 
+                // o qualcuno è arrivato prima. Non spaventarti, è normale nel MEV.
+                if (errorShort.includes("reverted")) {
+                    logAndNotify(`ℹ️ <b>FALLITO:</b> Simulazione fallita (Bersaglio già preso o asset debito errato).`);
+                } else {
+                    logAndNotify(`⚠️ <b>ERRORE RPC:</b> <code>${errorShort}</code>`);
+                }
             }
         }
     } catch (e) {}
