@@ -174,33 +174,57 @@ async function main() {
     setInterval(saveTargets, 300000);
 }
 
-// --- FUNZIONE DI CONTROLLO SINGOLO UTENTE ---
+// --- AGGIUNGI IN ALTO NELLO STATO ---
+const liquidationAttempts = new Map(); // Memorizza { user: timestamp_ultimo_sparo }
+
+// --- SOSTITUISCI LA FUNZIONE checkUser CON QUESTA ---
 async function checkUser(user, botContract) {
     try {
+        const now = Date.now();
+        
+        // 1. Controllo Cooldown (Evitiamo lo spam sullo stesso utente)
+        const lastAttempt = liquidationAttempts.get(user);
+        if (lastAttempt && (now - lastAttempt) < 120000) return; // Aspetta 2 minuti tra tentativi
+
         const data = await pManager.execute(async (prov) => {
             const pool = new ethers.Contract(AAVE_POOL, ["function getUserAccountData(address) view returns (uint256,uint256,uint256,uint256,uint256,uint256 hf)"], prov);
             return await pool.getUserAccountData(user);
         });
 
         const hf = parseFloat(ethers.formatUnits(data.hf, 18));
-        userCache.set(user, { hf: hf, lastCheck: Date.now() });
+        userCache.set(user, { hf: hf, lastCheck: now });
 
-        // Se Health Factor scende sotto 1.0 -> LIQUIDAZIONE
         if (hf < 1.0 && data.hf > 0n) {
             logAndNotify(`🚨 <b>TARGET VULNERABILE!</b>\nUser: <code>${user}</code>\nHF: ${hf.toFixed(4)}`);
             
-            // Tenta liquidazione (Esempio 1500 USDC)
-            // Il contratto revertirà se non è profittevole (protezione capitale)
-            botContract.requestFlashLoan(USDC, ethers.parseUnits("1500", 6), WETH, user)
-                .then(tx => {
-                    logAndNotify(`🔫 <b>TX Inviata!</b>\n<a href="https://arbiscan.io/tx/${tx.hash}">Vedi su Arbiscan</a>`);
-                })
-                .catch(() => {
-                    // Fallimento silenzioso (probabile simulazione gas fallita)
-                });
+            // Segnamo il tentativo per non spammare l'RPC
+            liquidationAttempts.set(user, now);
+
+            // 2. SPARO INTELLIGENTE (Usiamo pManager per inviare)
+            await pManager.execute(async (prov) => {
+                // Colleghiamo il contratto al provider che sta funzionando ora
+                const botWithProvider = botContract.connect(new ethers.Wallet(process.env.PRIVATE_KEY, prov));
+                
+                const feeData = await prov.getFeeData();
+                
+                // Invio transazione
+                const tx = await botWithProvider.requestFlashLoan(
+                    USDC, 
+                    ethers.parseUnits("1500", 6), 
+                    WETH, 
+                    user, 
+                    {
+                        maxPriorityFeePerGas: feeData.maxPriorityFeePerGas * 2n,
+                        maxFeePerGas: feeData.maxFeePerGas * 2n,
+                        gasLimit: 1000000 // Limit fisso per non chiedere al nodo di simulare (risparmio chiamate)
+                    }
+                );
+                
+                logAndNotify(`🔫 <b>TX Inviata!</b>\n<a href="https://arbiscan.io/tx/${tx.hash}">Vedi su Arbiscan</a>`);
+            });
         }
     } catch (e) {
-        // Errore RPC gestito dal ProviderManager, qui ignoriamo per passare al prossimo
+        // Se fallisce qui, il pManager passerà comunque al prossimo nodo al prossimo giro
     }
 }
 
