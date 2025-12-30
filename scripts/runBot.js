@@ -65,6 +65,8 @@ if (token) {
     });
 }
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 // Funzione Helper per inviare notifiche e salvare nel log
 function logAndNotify(message, type = "INFO") {
     console.log(`[${type}] ${message.replace(/<[^>]*>?/gm, '')}`); // Log pulito in console
@@ -113,17 +115,22 @@ async function main() {
 
     // Block Listener
     provider.on("block", async (blockNumber) => {
-        lastBlockProcessed = blockNumber; // Aggiorniamo lo stato per il comando /status
-        
+        lastBlockProcessed = blockNumber;
         const arr = Array.from(targets);
         if (arr.length === 0) return;
         
-        const BATCH = 20;
+        const BATCH = 15; // Controlliamo 15 utenti per blocco
         const start = (blockNumber * BATCH) % arr.length;
         const batch = arr.slice(start, start + BATCH);
         
-        console.log(`⚡️ Blocco ${blockNumber}: Check ${batch.length} utenti...`);
-        await Promise.all(batch.map(user => checkUser(user, aavePool, bot, provider)));
+        console.log(`⚡️ Blocco ${blockNumber}: Controllo ${batch.length} utenti...`);
+        
+        // --- NUOVA LOGICA ANTI-429 ---
+        for (const user of batch) {
+            await checkUser(user, aavePool, bot, provider);
+            // Aspetta 150ms tra un utente e l'altro per non far arrabbiare Alchemy
+            await sleep(150); 
+        }
     });
 
     setInterval(saveTargets, 300000); // Save ogni 5 min
