@@ -1,8 +1,8 @@
 # Usa un'immagine Node.js leggera
 FROM node:20-alpine
 
-# Installa vim e redis
-RUN apk add --no-cache vim redis
+# Installa vim
+RUN apk add --no-cache vim
 
 # Crea la cartella di lavoro
 WORKDIR /app
