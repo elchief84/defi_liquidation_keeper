@@ -1,54 +1,35 @@
 const { ethers } = require("hardhat");
-const fs = require("fs");
-const path = require("path");
+const Redis = require("ioredis");
 const TelegramBot = require('node-telegram-bot-api');
 require("dotenv").config();
 
 // --- CONFIGURAZIONE ---
-const MY_BOT_ADDRESS = "0x647Aa5C5321bD53E9B43CFB95213541d2945A684";
-const DATA_DIR = path.join(__dirname, "../data");
-const DB_FILE = path.join(DATA_DIR, "targets.json");
-const BLACKLIST_FILE = path.join(DATA_DIR, "blacklist.json");
-const AAVE_POOL = "0x794a61358D6845594F94dc1DB02A252b5b4814aD";
-const USDC = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
-const WETH = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1";
+const CONFIG = {
+    botAddress: process.env.MY_BOT_ADDRESS,
+    aavePool: process.env.AAVE_POOL_ADDRESS,
+    oracle: process.env.AAVE_ORACLE_ADDRESS,
+    subgraph: process.env.THE_GRAPH_URL,
+    debtAsset: process.env.DEBT_ASSET_ADDRESS,
+    debtSymbol: process.env.DEBT_ASSET_SYMBOL || "USDC",
+    debtDecimals: parseInt(process.env.DEBT_ASSET_DECIMALS || "6"),
+    collateralAsset: process.env.COLLATERAL_ASSET_ADDRESS,
+    chainId: parseInt(process.env.CHAIN_ID || "42161"),
+    redisUrl: process.env.REDIS_URL,
+    tgToken: process.env.TELEGRAM_BOT_TOKEN,
+    tgChatId: process.env.TELEGRAM_CHAT_ID
+};
 
-// --- STATO ---
-let isBotEnabled = true;
-let targets = new Set();
-let blacklist = new Map();
+const redis = new Redis(CONFIG.redisUrl);
+let currentEthPrice = 0;
 let lastBlockProcessed = 0;
 let telegramBot = null;
+let activityLog = []; // Ripristinato lo storico
 
-const token = process.env.TELEGRAM_BOT_TOKEN;
-const chatId = process.env.TELEGRAM_CHAT_ID ? process.env.TELEGRAM_CHAT_ID.trim() : null;
-
-// --- 1. TELEGRAM SETUP (Immediato) ---
-if (token && chatId) {
-    telegramBot = new TelegramBot(token, { polling: { autoStart: true, params: { drop_pending_updates: true } } });
-    console.log("🟢 [SYSTEM] Telegram Bot inizializzato.");
-
-    telegramBot.onText(/\/status/, (msg) => {
-        if (msg.chat.id.toString() !== chatId) return;
-        const statusMsg = `🤖 <b>STATO BOT</b>\n━━━━━━━━━━━━━━\n✅ Attivo: ${isBotEnabled ? 'SÌ' : 'NO'}\n🎯 Targets: ${targets.size}\n🚫 Blacklist: ${blacklist.size}\n📦 Blocco: ${lastBlockProcessed}`;
-        telegramBot.sendMessage(chatId, statusMsg, { parse_mode: 'HTML' });
-    });
-
-    telegramBot.onText(/\/stop/, () => { isBotEnabled = false; telegramBot.sendMessage(chatId, "🛑 Bot sospeso."); });
-    telegramBot.onText(/\/start/, () => { isBotEnabled = true; telegramBot.sendMessage(chatId, "🚀 Bot riattivato."); });
-}
-
-// --- 2. MULTI-PROVIDER MANAGER ---
-const rpcUrls = [
-    process.env.RPC_2,
-    process.env.RPC_3,
-    "https://arb1.arbitrum.io/rpc",
-    process.env.RPC_1
-].filter(url => url);
-
+// --- GESTORE PROVIDER ---
+const rpcUrls = [process.env.RPC_2, process.env.RPC_3, "https://arb1.arbitrum.io/rpc", process.env.RPC_1].filter(url => url);
 class SmartProviderManager {
     constructor(urls) {
-        this.providers = urls.map(url => new ethers.JsonRpcProvider(url, 42161, { staticNetwork: true }));
+        this.providers = urls.map(url => new ethers.JsonRpcProvider(url, CONFIG.chainId, { staticNetwork: true }));
         this.index = 0;
     }
     async execute(task) {
@@ -58,7 +39,6 @@ class SmartProviderManager {
                 this.index = (this.index + 1) % this.providers.length;
                 return res;
             } catch (err) {
-                console.log(`⚠️ [RPC] Nodo ${this.index} in difficoltà, ruoto...`);
                 this.index = (this.index + 1) % this.providers.length;
                 if (i === this.providers.length - 1) throw err;
             }
@@ -67,122 +47,123 @@ class SmartProviderManager {
 }
 const pManager = new SmartProviderManager(rpcUrls);
 
-// --- 3. HELPER NOTIFICHE ---
+// --- NOTIFICHE E LOG ---
 function logAndNotify(message) {
     const timestamp = new Date().toLocaleTimeString('it-IT');
-    console.log(`✨ [EVENTO] ${message.replace(/<[^>]*>?/gm, '')}`);
-    if (telegramBot && chatId) {
-        telegramBot.sendMessage(chatId, message, { parse_mode: 'HTML' }).catch(() => {});
+    console.log(`[${timestamp}] ${message.replace(/<[^>]*>?/gm, '')}`);
+    activityLog.unshift(`[${timestamp}] ${message}`);
+    if (activityLog.length > 5) activityLog.pop();
+    if (telegramBot && CONFIG.tgChatId) {
+        telegramBot.sendMessage(CONFIG.tgChatId, message, { parse_mode: 'HTML', disable_web_page_preview: true }).catch(()=>{});
     }
 }
 
-// --- 4. FUNZIONE PRINCIPALE ---
-async function main() {
-    console.log("🦅 [START] Avvio logica Cecchino DeFi...");
-
-    // Caricamento Dati
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    if (fs.existsSync(DB_FILE)) {
-        try { 
-            const t = JSON.parse(fs.readFileSync(DB_FILE));
-            t.forEach(addr => targets.add(addr.toLowerCase()));
-            console.log(`📂 [DB] Caricati ${targets.size} target.`);
-        } catch(e) { console.log("❌ [DB] Errore caricamento targets.json"); }
-    }
-    if (fs.existsSync(BLACKLIST_FILE)) {
-        try { 
-            const b = JSON.parse(fs.readFileSync(BLACKLIST_FILE));
-            blacklist = new Map(Object.entries(b));
-            console.log(`📂 [DB] Caricata blacklist: ${blacklist.size} utenti.`);
-        } catch(e) { console.log("❌ [DB] Errore caricamento blacklist.json"); }
-    }
-
-    const eventProvider = new ethers.JsonRpcProvider("https://arb1.arbitrum.io/rpc", 42161, { staticNetwork: true });
-    const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, eventProvider);
-    const botContract = await ethers.getContractAt("AaveLiquidator", MY_BOT_ADDRESS, wallet);
-
-    console.log("🔗 [NETWORK] Connesso ad Arbitrum. In attesa di blocchi...");
-    logAndNotify("🚀 <b>Bot Online</b> - Inizio scansione.");
-
-    eventProvider.on("block", async (blockNumber) => {
-        if (!isBotEnabled) return;
-
-        // Log ogni 10 blocchi per mostrare che il bot è vivo
-        if (blockNumber % 10 === 0) {
-            console.log(`💓 [HEARTBEAT] Blocco: ${blockNumber} | Target monitorati: ${targets.size}`);
-        }
-
-        // Scansione ogni 5 blocchi
-        if (blockNumber % 5 !== 0) return;
-        lastBlockProcessed = blockNumber;
-        
-        const arr = Array.from(targets);
-        if (arr.length === 0) return;
-
-        const startIdx = (blockNumber * 12) % arr.length;
-        const batch = arr.slice(startIdx, startIdx + 12);
-
-        // console.log(`🔍 [SCAN] Controllo batch da ${startIdx} a ${startIdx + batch.length}`);
-
-        for (const user of batch) {
-            checkUser(user, botContract);
-        }
-    });
-
-    // Salvataggio periodico
-    setInterval(() => {
-        try {
-            fs.writeFileSync(DB_FILE, JSON.stringify(Array.from(targets)));
-            fs.writeFileSync(BLACKLIST_FILE, JSON.stringify(Object.fromEntries(blacklist)));
-            console.log("💾 [SYSTEM] Backup database eseguito.");
-        } catch (e) { console.log("❌ [SYSTEM] Errore backup."); }
-    }, 300000); // 5 minuti
-}
-
-async function checkUser(user, botContract) {
-    const userAddr = user.toLowerCase();
-    const now = Date.now();
-
-    if (blacklist.has(userAddr)) {
-        if (now - blacklist.get(userAddr) < 24 * 60 * 60 * 1000) return;
-        else {
-            blacklist.delete(userAddr);
-            console.log(`♻️ [BLACKLIST] Utente ${userAddr} rimosso (tempo scaduto).`);
-        }
-    }
-
+// --- LOGICA CORE ---
+async function syncUser(user) {
     try {
         const data = await pManager.execute(async (prov) => {
-            const pool = new ethers.Contract(AAVE_POOL, ["function getUserAccountData(address) view returns (uint256,uint256,uint256,uint256,uint256,uint256 hf)"], prov);
-            return await pool.getUserAccountData(userAddr);
+            const pool = new ethers.Contract(CONFIG.aavePool, ["function getUserAccountData(address) view returns (uint256 col, uint256 debt, uint256, uint256 thr, uint256, uint256 hf)"], prov);
+            return await pool.getUserAccountData(user);
         });
+        if (data.debt === 0n) return;
+        await redis.hset(`user:${user.toLowerCase()}`, {
+            collateralBase: ethers.formatUnits(data.col, 8),
+            debtBase: ethers.formatUnits(data.debt, 8),
+            threshold: (Number(data.thr) / 10000).toString(),
+            lastSync: Date.now().toString()
+        });
+    } catch (e) {}
+}
 
-        const hf = parseFloat(ethers.formatUnits(data.hf, 18));
-        
-        // Log se un utente è "caldo" (HF basso ma non ancora liquidabile)
-        if (hf < 1.10 && hf > 1.0) {
-            console.log(`🔥 [ALERT] Utente a rischio: ${userAddr} | HF: ${hf.toFixed(4)}`);
-        }
+async function runDiscovery() {
+    const keys = await redis.keys('user:*');
+    if (keys.length < 500) {
+        const needed = 2000 - keys.length;
+        logAndNotify(`🕸️ <b>Discovery:</b> Recupero ${needed} nuovi utenti...`);
+        const query = `{ users(first: ${needed}, where: {borrows_: {reserve_: {symbol: "${CONFIG.debtSymbol}"}}}) { id } }`;
+        try {
+            const res = await fetch(CONFIG.subgraph, { method: "POST", body: JSON.stringify({ query }) });
+            const json = await res.json();
+            for (let u of json.data.users) await syncUser(u.id);
+            logAndNotify(`✅ Database ricaricato a ${await redis.keys('user:*').then(k => k.length)} utenti.`);
+        } catch (e) { console.error("Discovery Fallita."); }
+    }
+}
 
-        if (hf < 1.0 && data.hf > 0n) {
-            blacklist.set(userAddr, now);
-            logAndNotify(`🚨 <b>TARGET TROVATO!</b>\nUser: <code>${userAddr}</code>\nHF: ${hf.toFixed(4)}`);
-            
-            try {
-                const fee = await pManager.providers[2].getFeeData();
-                const tx = await botContract.requestFlashLoan(USDC, ethers.parseUnits("1200", 6), WETH, userAddr, {
-                    gasLimit: 1100000,
-                    maxPriorityFeePerGas: fee.maxPriorityFeePerGas * 6n,
-                    maxFeePerGas: fee.maxFeePerGas * 2n
-                });
-                logAndNotify(`🔫 <b>COLPO LANCIATO!</b>\n<a href="https://arbiscan.io/tx/${tx.hash}">Dettagli</a>`);
-            } catch (err) {
-                console.log(`❌ [TX] Fallimento invio per ${userAddr}: ${err.message.substring(0, 50)}`);
+async function runSimulation(botContract) {
+    if (currentEthPrice === 0) return;
+    const stream = redis.scanStream({ match: 'user:*', count: 100 });
+    stream.on('data', async (keys) => {
+        for (const key of keys) {
+            const state = await redis.hgetall(key);
+            const user = key.replace('user:', '');
+            const simulatedHF = (parseFloat(state.collateralBase) * parseFloat(state.threshold)) / parseFloat(state.debtBase);
+
+            if (simulatedHF < 1.02) {
+                if (await redis.exists(`blacklist:${user}`)) continue;
+                try {
+                    const data = await pManager.execute(async (prov) => {
+                        const pool = new ethers.Contract(CONFIG.aavePool, ["function getUserAccountData(address) view returns (uint256,uint256,uint256,uint256,uint256,uint256 hf)"], prov);
+                        return await pool.getUserAccountData(user);
+                    });
+                    const realHF = parseFloat(ethers.formatUnits(data.hf, 18));
+                    if (realHF < 1.0) {
+                        await redis.set(`blacklist:${user}`, "1", "EX", 3600);
+                        const tx = await botContract.requestFlashLoan(CONFIG.debtAsset, ethers.parseUnits("1000", CONFIG.debtDecimals), CONFIG.collateralAsset, user, { gasLimit: 1000000 });
+                        logAndNotify(`🔫 <b>COLPO!</b> User: ${user}\n<a href="https://arbiscan.io/tx/${tx.hash}">Dettagli</a>`);
+                    }
+                } catch (e) {}
             }
         }
-    } catch (e) {
-        // Errore RPC già loggato dal manager
+    });
+}
+
+async function main() {
+    console.log(`🦅 [OMNI-BOT] Avvio Chain: ${CONFIG.chainId}`);
+    await runDiscovery();
+
+    const eventProvider = new ethers.JsonRpcProvider(rpcUrls[0], CONFIG.chainId, { staticNetwork: true });
+    const botContract = await ethers.getContractAt("AaveLiquidator", CONFIG.botAddress, new ethers.Wallet(process.env.PRIVATE_KEY, eventProvider));
+
+    if (CONFIG.tgToken) {
+        telegramBot = new TelegramBot(CONFIG.tgToken, { polling: true });
+        telegramBot.onText(/\/status/, async () => {
+            const count = (await redis.keys('user:*')).length;
+            telegramBot.sendMessage(CONFIG.tgChatId, `✅ <b>Bot Online</b>\n🎯 Target: ${count}\n💰 ETH: ${currentEthPrice}$\n📦 Blocco: ${lastBlockProcessed}`, {parse_mode: 'HTML'});
+        });
+        telegramBot.onText(/\/activity/, () => {
+            telegramBot.sendMessage(CONFIG.tgChatId, `📋 <b>ATTIVITÀ</b>\n\n${activityLog.join('\n\n')}`, {parse_mode: 'HTML'});
+        });
     }
+
+    logAndNotify("🚀 <b>Sistemi Operativi.</b>");
+
+    // Monitoraggio Prezzo
+    setInterval(async () => {
+        try {
+            const priceData = await pManager.execute(async (prov) => {
+                const oracle = new ethers.Contract(CONFIG.oracle, ["function getAssetPrice(address) view returns (uint256)"], prov);
+                return await oracle.getAssetPrice(CONFIG.collateralAsset);
+            });
+            currentEthPrice = Number(ethers.formatUnits(priceData, 8));
+            runSimulation(botContract);
+        } catch (e) {}
+    }, 5000);
+
+    // Re-Sync Periodico
+    setInterval(runDiscovery, 10 * 60 * 1000);
+    setInterval(async () => {
+        const keys = await redis.keys('user:*');
+        for (let i = 0; i < 15; i++) {
+            const key = keys[Math.floor(Math.random() * keys.length)];
+            if (key) await syncUser(key.replace('user:', ''));
+        }
+    }, 60000);
+
+    eventProvider.on("block", (bn) => { 
+        lastBlockProcessed = bn; 
+        if (bn % 20 === 0) console.log(`💓 Heartbeat: Blocco ${bn} | ETH: ${currentEthPrice}$`);
+    });
 }
 
 main().catch(console.error);
