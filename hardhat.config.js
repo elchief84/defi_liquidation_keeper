@@ -1,7 +1,7 @@
 require("@nomicfoundation/hardhat-toolbox");
 require("dotenv").config();
 
-const ALCHEMY_HTTP_URL = process.env.ALCHEMY_HTTP_URL;
+const ALCHEMY_HTTP_URL = process.env.RPC_1;
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 
 module.exports = {
