@@ -37,3 +37,4 @@ ignition/deployments/chain-31337
 targets.json
 data/response.json
 targets.json
+.env.production
